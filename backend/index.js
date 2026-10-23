@@ -1,10 +1,13 @@
 
+const fs = require("fs");
+const path = require("path");
 const express = require("express");
 const session = require("express-session");
 const pgSession = require("connect-pg-simple")(session);
 const pool = require("./db");
 const bcrypt = require("bcrypt");
-const { writeAudit } = require("./audit");
+const { writeAudit, verifyAuditChain } = require("./audit");
+const uploadRouter = require("./uploads");
 require("dotenv").config();
 
 const app = express();
@@ -136,6 +139,60 @@ function requireRole(...allowedRoles) {
   };
 }
 
+app.get(
+  "/api/admin/audit-logs",
+  requireAuth,
+  requireRole("admin"),
+  async (req, res) => {
+    try {
+      const requestedLimit = Number.parseInt(req.query.limit, 10);
+      const limit = Number.isInteger(requestedLimit)
+        ? Math.min(Math.max(requestedLimit, 1), 200)
+        : 100;
+
+      const [logs, integrity] = await Promise.all([
+        pool.query(
+  `SELECT
+     a.id,
+     a.action,
+     a.document_id,
+     a.target_user_id,
+     a.outcome,
+     a.details,
+     a.previous_hash,
+     a.entry_hash,
+     a.created_at,
+     actor.email AS actor_email,
+     target.email AS target_email
+   FROM public.audit_chain_logs a
+   LEFT JOIN users actor ON actor.id = a.actor_id
+   LEFT JOIN users target ON target.id = a.target_user_id
+   ORDER BY a.id DESC
+   LIMIT $1`,
+  [limit]
+),
+        verifyAuditChain(),
+      ]);
+
+      res.json({
+        events: logs.rows,
+        integrity,
+      });
+    } catch (error) {
+      console.error("Admin audit log retrieval failed:", error);
+      res.status(500).json({
+        error: "Unable to retrieve audit logs",
+      });
+    }
+  }
+);
+
+app.use(
+  "/api/documents/upload",
+  requireAuth,
+  requireRole("owner"),
+  uploadRouter
+);
 // Role authorization test endpoint
 app.get(
   "/api/test/admin",
@@ -214,10 +271,18 @@ app.post(
       );
 
       if (documentResult.rows.length === 0) {
-        return res.status(404).json({
-          error: "Document not found.",
-        });
-      }
+  await writeAudit({
+    actorId: req.user.id,
+    action: "permission.grant",
+    documentId: req.params.id,
+    outcome: "denied",
+    details: { reason: "document_not_found" },
+  });
+
+  return res.status(404).json({
+    error: "Document not found.",
+  });
+}
 
       const recipientResult = await pool.query(
         "SELECT id, role FROM users WHERE email = $1",
@@ -226,17 +291,35 @@ app.post(
 
       const recipient = recipientResult.rows[0];
 
-      if (!recipient || recipient.role === "admin") {
-        return res.status(400).json({
-          error: "A valid non-admin recipient is required.",
-        });
-      }
+if (!recipient || recipient.role === "admin") {
+  await writeAudit({
+    actorId: req.user.id,
+    action: "permission.grant",
+    documentId: req.params.id,
+    targetUserId: recipient?.id ?? null,
+    outcome: "denied",
+    details: { reason: "invalid_recipient" },
+  });
 
-      if (recipient.id === req.user.id) {
-        return res.status(400).json({
-          error: "You cannot grant access to yourself.",
-        });
-      }
+  return res.status(400).json({
+    error: "A valid non-admin recipient is required.",
+  });
+}
+if (recipient.id === req.user.id) {
+  await writeAudit({
+    actorId: req.user.id,
+    action: "permission.grant",
+    documentId: req.params.id,
+    targetUserId: recipient.id,
+    outcome: "denied",
+    details: { reason: "self_grant" },
+  });
+
+  return res.status(400).json({
+    error: "You cannot grant access to yourself.",
+  });
+}
+
 
       const grantResult = await pool.query(
         `INSERT INTO document_permissions
@@ -293,11 +376,21 @@ app.delete(
         [req.params.id, req.params.userId, req.user.id]
       );
 
-      if (result.rows.length === 0) {
-        return res.status(404).json({
-          error: "Document or permission grant not found.",
-        });
-      }
+if (result.rows.length === 0) {
+  await writeAudit({
+    actorId: req.user.id,
+    action: "permission.revoke",
+    documentId: req.params.id,
+    targetUserId: req.params.userId,
+    outcome: "denied",
+    details: { reason: "document_or_grant_not_found" },
+  });
+
+  return res.status(404).json({
+    error: "Document or permission grant not found.",
+  });
+}
+
       await writeAudit({
   actorId: req.user.id,
   action: "permission.revoke",
@@ -347,6 +440,102 @@ const result = await pool.query(
     });
   }
 });
+
+app.get(
+  "/api/documents/:id/download",
+  requireAuth,
+  requireRole("owner", "viewer"),
+  async (req, res) => {
+    try {
+      const result = await pool.query(
+        `SELECT d.id, d.owner_id, d.storage_path, d.name,
+                d.mime_type
+         FROM documents d
+         LEFT JOIN document_permissions p
+           ON p.document_id = d.id
+          AND p.user_id = $2
+         WHERE d.id = $1
+           AND (
+             d.owner_id = $2
+             OR p.permission IN ('read', 'edit')
+           )`,
+        [req.params.id, req.user.id]
+      );
+
+      const document = result.rows[0];
+
+      if (!document || !document.storage_path) {
+        await writeAudit({
+          actorId: req.user.id,
+          action: "document.download",
+          documentId: req.params.id,
+          outcome: "denied",
+          details: { reason: "not_found_or_no_access" },
+        });
+
+        return res.status(404).json({
+          error: "Document not found or access denied.",
+        });
+      }
+
+      const uploadDirectory = path.resolve(__dirname, "uploads");
+      const filename = path.basename(document.storage_path);
+      const filePath = path.resolve(uploadDirectory, filename);
+
+      if (
+  filePath === uploadDirectory ||
+  !filePath.startsWith(uploadDirectory + path.sep) ||
+  !fs.existsSync(filePath) ||
+  !fs.statSync(filePath).isFile()
+) {
+        await writeAudit({
+          actorId: req.user.id,
+          action: "document.download",
+          documentId: document.id,
+          outcome: "failure",
+          details: { reason: "stored_file_missing_or_invalid" },
+        });
+
+        return res.status(404).json({
+          error: "Stored file not found.",
+        });
+      }
+
+      res.setHeader("Content-Type", document.mime_type || "application/octet-stream");
+
+res.download(filePath, document.name, async (error) => {
+        try {
+          await writeAudit({
+            actorId: req.user.id,
+            action: "document.download",
+            documentId: document.id,
+            outcome: error ? "failure" : "success",
+            details: error
+              ? { reason: "transfer_failed" }
+              : { reason: "transfer_completed" },
+          });
+        } catch (auditError) {
+          console.error("Download audit failed:", auditError.message);
+        }
+
+        if (error && !res.headersSent) {
+          res.status(500).json({
+            error: "Unable to download document.",
+          });
+        }
+      });
+    } catch (error) {
+      console.error("Document download failed:", error.message);
+
+      if (!res.headersSent) {
+        return res.status(500).json({
+          error: "Unable to download document.",
+        });
+      }
+    }
+  }
+);
+
 
  // Get one document only when the requester has access
 // Get one document only when requester has access; audit the outcome
@@ -411,6 +600,143 @@ app.get("/api/auth/me", requireAuth, (req, res) => {
     user: req.user,
   });
 });
+
+ // Edit document metadata: owner or user with explicit edit permission
+app.put(
+  "/api/documents/:id",
+  requireAuth,
+  requireRole("owner", "viewer"),
+  async (req, res) => {
+    const { name, category } = req.body;
+
+    if (
+      typeof name !== "string" ||
+      !name.trim() ||
+      typeof category !== "string" ||
+      !category.trim()
+    ) {
+      return res.status(400).json({
+        error: "Document name and category are required.",
+      });
+    }
+
+    try {
+      const result = await pool.query(
+        `UPDATE documents d
+         SET name = $1, category = $2
+         WHERE d.id = $3
+           AND (
+             d.owner_id = $4
+             OR EXISTS (
+               SELECT 1
+               FROM document_permissions p
+               WHERE p.document_id = d.id
+                 AND p.user_id = $4
+                 AND p.permission = 'edit'
+             )
+           )
+         RETURNING d.id, d.owner_id, d.name, d.category, d.created_at`,
+        [name.trim(), category.trim(), req.params.id, req.user.id]
+      );
+
+      if (result.rows.length === 0) {
+        await writeAudit({
+          actorId: req.user.id,
+          action: "document.edit",
+          documentId: req.params.id,
+          outcome: "denied",
+          details: { reason: "not_found_or_no_edit_access" },
+        });
+
+        return res.status(404).json({
+          error: "Document not found or access denied.",
+        });
+      }
+
+      await writeAudit({
+        actorId: req.user.id,
+        action: "document.edit",
+        documentId: req.params.id,
+        outcome: "success",
+      });
+
+      return res.status(200).json({ document: result.rows[0] });
+    } catch (error) {
+      console.error("Document edit failed:", error.message);
+      return res.status(500).json({
+        error: "Unable to edit document.",
+      });
+    }
+  }
+);
+
+// Delete a document: owner only
+app.delete(
+  "/api/documents/:id",
+  requireAuth,
+  requireRole("owner"),
+  async (req, res) => {
+    try {
+      const result = await pool.query(
+        `SELECT id, owner_id, storage_path
+         FROM documents
+         WHERE id = $1 AND owner_id = $2`,
+        [req.params.id, req.user.id]
+      );
+
+      const document = result.rows[0];
+
+      if (!document) {
+        await writeAudit({
+          actorId: req.user.id,
+          action: "document.delete",
+          documentId: req.params.id,
+          outcome: "denied",
+          details: { reason: "not_found_or_not_owner" },
+        });
+
+        return res.status(404).json({
+          error: "Document not found or access denied.",
+        });
+      }
+
+      // Remove the database record first; never use a client-supplied path.
+      await pool.query(
+        "DELETE FROM documents WHERE id = $1 AND owner_id = $2",
+        [document.id, req.user.id]
+      );
+
+      const uploadDirectory = path.resolve(__dirname, "uploads");
+      const filename = path.basename(document.storage_path || "");
+      const filePath = path.resolve(uploadDirectory, filename);
+
+      if (
+        filename &&
+        filePath.startsWith(uploadDirectory + path.sep) &&
+        fs.existsSync(filePath) &&
+        fs.statSync(filePath).isFile()
+      ) {
+        fs.unlinkSync(filePath);
+      }
+
+      await writeAudit({
+        actorId: req.user.id,
+        action: "document.delete",
+        documentId: document.id,
+        outcome: "success",
+      });
+
+      return res.status(200).json({
+        message: "Document deleted.",
+      });
+    } catch (error) {
+      console.error("Document deletion failed:", error.message);
+      return res.status(500).json({
+        error: "Unable to delete document.",
+      });
+    }
+  }
+);
 
  // Logout endpoint
 app.post("/api/auth/logout", (req, res) => {
