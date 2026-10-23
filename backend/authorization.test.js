@@ -201,7 +201,6 @@ describe("TrustVault authorization boundaries", () => {
     const response = await request(app).get("/api/admin/audit-logs");
     expect(response.status).toBe(401);
   });
-  
 test("audit verifier detects a modified event without changing production data", async () => {
   const stableStringify = (value) => {
     if (value === null || typeof value !== "object") {
