@@ -638,14 +638,27 @@ app.get(
   requireAuth,
   requireRole("owner", "viewer"),
   async (req, res) => {  try {
+    /*console.log("DOCUMENT LIST DEBUG:", {
+  userId: req.user.id,
+  role: req.user.role,
+});*/
 const result = await pool.query(
-  `SELECT DISTINCT d.id, d.owner_id, d.name, d.category, d.created_at
+  `SELECT DISTINCT
+     d.id,
+     d.owner_id,
+     d.name,
+     d.category,
+     d.created_at,
+     CASE
+       WHEN d.owner_id = $1 THEN 'owner'
+       ELSE p.permission
+     END AS access_level
    FROM documents d
    LEFT JOIN document_permissions p
      ON p.document_id = d.id
     AND p.user_id = $1
    WHERE d.owner_id = $1
-      OR p.user_id = $1
+      OR p.permission IN ('read', 'edit')
    ORDER BY d.created_at DESC`,
   [req.user.id]
 );
@@ -724,27 +737,59 @@ app.get(
 
       res.setHeader("Content-Type", document.mime_type || "application/octet-stream");
 
-res.download(filePath, document.name, async (error) => {
-        try {
-          await writeAudit({
-            actorId: req.user.id,
-            action: "document.download",
-            documentId: document.id,
-            outcome: error ? "denied" : "success",
-            details: error
-              ? { reason: "transfer_failed" }
-              : { reason: "transfer_completed" },
-          });
-        } catch (auditError) {
-          console.error("Download audit failed:", auditError.message);
-        }
+const inline = req.query.inline === "1";
 
-        if (error && !res.headersSent) {
-          res.status(500).json({
-            error: "Unable to download document.",
-          });
-        }
+res.setHeader(
+  "Content-Type",
+  document.mime_type || "application/pdf"
+);
+
+if (inline) {
+  res.setHeader(
+    "Content-Disposition",
+    `inline; filename="${path.basename(document.name).replace(/["\\\r\n]/g, "_")}"`
+  );
+
+  return res.sendFile(filePath, async (error) => {
+    try {
+      await writeAudit({
+        actorId: req.user.id,
+        action: "document.read",
+        documentId: document.id,
+        outcome: error ? "denied" : "success",
+        details: error
+          ? { reason: "preview_failed" }
+          : { reason: "preview_completed" },
       });
+    } catch (auditError) {
+      console.error("Preview audit failed:", auditError.message);
+    }
+
+    if (error && !res.headersSent) {
+      res.status(500).json({ error: "Unable to preview document." });
+    }
+  });
+}
+
+return res.download(filePath, document.name, async (error) => {
+  try {
+    await writeAudit({
+      actorId: req.user.id,
+      action: "document.download",
+      documentId: document.id,
+      outcome: error ? "denied" : "success",
+      details: error
+        ? { reason: "transfer_failed" }
+        : { reason: "transfer_completed" },
+    });
+  } catch (auditError) {
+    console.error("Download audit failed:", auditError.message);
+  }
+
+  if (error && !res.headersSent) {
+    res.status(500).json({ error: "Unable to download document." });
+  }
+});
     } catch (error) {
       console.error("Document download failed:", error.message);
 

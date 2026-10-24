@@ -2,7 +2,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import "./App.css";
 
-const API = "/api";
+const API = import.meta.env.VITE_API_URL || "/api";
 
 async function apiRequest(url, options = {}) {
   const response = await fetch(`${API}${url}`, {
@@ -30,7 +30,8 @@ function App() {
   const [auditLoading, setAuditLoading] = useState(false);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
+const [error, setError] = useState("");
+const [cooldownSeconds, setCooldownSeconds] = useState(0);
   const [notice, setNotice] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -76,7 +77,6 @@ const [documentPermissions, setDocumentPermissions] = useState([]);
       setNotice(`Access granted to ${permissionEmail.trim()}.`);
       await loadDocumentPermissions(permissionDoc.id);
       setPermissionEmail("");
-      setPermissionDoc(null);
     } catch (err) {
       setError(err.message);
     }
@@ -107,6 +107,15 @@ const [documentPermissions, setDocumentPermissions] = useState([]);
   useEffect(() => {
     checkSession();
   }, [checkSession]);
+  useEffect(() => {
+  if (cooldownSeconds <= 0) return;
+
+  const timer = setTimeout(() => {
+    setCooldownSeconds((seconds) => Math.max(0, seconds - 1));
+  }, 1000);
+
+  return () => clearTimeout(timer);
+}, [cooldownSeconds]);
 
     useEffect(() => {
     if (!user) return;
@@ -160,26 +169,36 @@ const [documentPermissions, setDocumentPermissions] = useState([]);
 }, [documents, search, category, createdAfter, createdBefore]);
 
   async function handleLogin(event) {
-    event.preventDefault();
-    setBusy(true);
-    setError("");
+  event.preventDefault();
 
-    try {
-      const result = await apiRequest("/auth/login", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email, password }),
-      });
+  if (cooldownSeconds > 0) return;
 
-      setUser(result.user);
-      setPassword("");
-      setNotice("Welcome to TrustVault.");
-    } catch (err) {
-      setError(err.message);
-    } finally {
-      setBusy(false);
+  setBusy(true);
+  setError("");
+
+  try {
+    const result = await apiRequest("/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password }),
+    });
+
+    setUser(result.user);
+    setPassword("");
+    setNotice("Welcome to TrustVault.");
+    setCooldownSeconds(0);
+  } catch (err) {
+    const match = err.message.match(/Try again in (\d+) seconds/i);
+
+    if (match) {
+      setCooldownSeconds(Number(match[1]));
     }
+
+    setError(err.message);
+  } finally {
+    setBusy(false);
   }
+}
 
   async function handleLogout() {
     setError("");
@@ -227,7 +246,13 @@ const [documentPermissions, setDocumentPermissions] = useState([]);
       setBusy(false);
     }
   }
-
+function handleRead(doc) {
+  window.open(
+    `${API}/documents/${doc.id}/download?inline=1`,
+    "_blank",
+    "noopener,noreferrer"
+  );
+}
   async function handleDownload(doc) {
     setError("");
     try {
@@ -311,6 +336,13 @@ const [documentPermissions, setDocumentPermissions] = useState([]);
           {error && <div className="alert error">{error}</div>}
 
           <form className="login-form" onSubmit={handleLogin}>
+            {cooldownSeconds > 0 && (
+  <p role="status" aria-live="polite">
+    Login temporarily locked. Try again in{" "}
+    {Math.floor(cooldownSeconds / 60)}:
+    {String(cooldownSeconds % 60).padStart(2, "0")}.
+  </p>
+)}
             <label htmlFor="email">Email address</label>
             <input
               id="email"
@@ -320,6 +352,7 @@ const [documentPermissions, setDocumentPermissions] = useState([]);
               onChange={(event) => setEmail(event.target.value)}
               placeholder="you@company.com"
               required
+              disabled={busy || cooldownSeconds > 0}
             />
 
             <label htmlFor="password">Password</label>
@@ -331,11 +364,22 @@ const [documentPermissions, setDocumentPermissions] = useState([]);
               onChange={(event) => setPassword(event.target.value)}
               placeholder="Enter your password"
               required
+              disabled={busy || cooldownSeconds > 0}
             />
 
-            <button className="primary-button full-width" disabled={busy}>
-              {busy ? "Signing in…" : "Sign in securely"}
-            </button>
+            <button
+  type="submit"
+  className="primary-button full-width"
+  disabled={busy || cooldownSeconds > 0}
+>
+  {busy
+    ? "Signing in…"
+    : cooldownSeconds > 0
+      ? `Try again in ${Math.floor(cooldownSeconds / 60)}:${String(
+          cooldownSeconds % 60
+        ).padStart(2, "0")}`
+      : "Sign in securely"}
+</button>
           </form>
 
           <p className="login-footnote">
@@ -763,39 +807,62 @@ const [documentPermissions, setDocumentPermissions] = useState([]);
                     <td>{doc.created_at ? new Date(doc.created_at).toLocaleDateString() : "—"}</td>
                     <td>
                       <div className="row-actions">
-                        <button onClick={() => handleDownload(doc)} title="Download">
-                          Download
-                        </button>
-                        {role === "owner" && (
-                          <>
-                            <button onClick={() => handleEdit(doc)} title="Edit metadata">
-  Edit
-</button>
+  <button
+    type="button"
+    onClick={() => handleRead(doc)}
+    title="Read document"
+  >
+    Read
+  </button>
 
-<button
-  type="button"
-  onClick={() => {
-  setPermissionDoc(doc);
-  setPermissionEmail("");
-  setPermissionLevel("read");
-  setDocumentPermissions([]);
-  setError("");
-  setNotice("");
-  loadDocumentPermissions(doc.id).catch((err) => setError(err.message));
-}}
->
-  Manage Access
-</button>
-                            <button
-                              className="danger-action"
-                              onClick={() => handleDelete(doc)}
-                              title="Delete document"
-                            >
-                              Delete
-                            </button>
-                          </>
-                        )}
-                      </div>
+  {(role === "owner" || doc.access_level === "edit") && (
+    <button
+      type="button"
+      onClick={() => handleEdit(doc)}
+      title="Edit metadata"
+    >
+      Edit
+    </button>
+  )}
+
+  <button
+    type="button"
+    onClick={() => handleDownload(doc)}
+    title="Download"
+  >
+    Download
+  </button>
+
+  {role === "owner" && (
+    <>
+      <button
+        type="button"
+        onClick={() => {
+          setPermissionDoc(doc);
+          setPermissionEmail("");
+          setPermissionLevel("read");
+          setDocumentPermissions([]);
+          setError("");
+          setNotice("");
+          loadDocumentPermissions(doc.id).catch((err) =>
+            setError(err.message)
+          );
+        }}
+      >
+        Manage Access
+      </button>
+
+      <button
+        type="button"
+        className="danger-action"
+        onClick={() => handleDelete(doc)}
+        title="Delete document"
+      >
+        Delete
+      </button>
+    </>
+  )}
+</div>
                     </td>
                   </tr>
                 ))}

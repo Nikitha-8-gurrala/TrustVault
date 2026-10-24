@@ -7,7 +7,7 @@ export default defineConfig({
   server: {
     proxy: {
       "/api": {
-        target: "https://trustvault-api-p7pt.onrender.com",
+        target: "http://localhost:3000",
         changeOrigin: true,
         secure: true,
       },
