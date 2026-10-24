@@ -1,132 +1,144 @@
 # TrustVault — Threat Model
 
-Status: Initial assessment; authentication foundation implemented and locally tested. Document-security controls remain pending.  
-Last updated: 2026-10-21
+**Last updated:** 24 October 2026
 
-## 1. Purpose
+## 1. What is this file about?
 
-TrustVault is a document storage and sharing application. This document identifies potential security threats, planned controls, verification results, and remaining limitations.
+TrustVault is a document-sharing application. The main goal is to make sure that only the right people can access a document.
 
-A control is considered verified only to the extent supported by actual implementation and test evidence. Local testing does not establish production security.
+While building it, I thought about what could go wrong, how I could prevent it, and what still needs improvement. This file explains those decisions honestly.
 
-## 2. Roles and intended permissions
+## 2. Who can do what?
 
-- **Admin:** Intended to manage users and review activity, but must not read document contents.
-- **Owner:** Intended to manage their own documents and grant or revoke access.
-- **Viewer:** Intended to read or download documents only when explicitly authorized.
+- **Admin:** Can view audit logs and check whether the audit records are intact.
+- **Owner:** Can upload and manage their own documents and share them with other users.
+- **Viewer:** Can read or download documents shared with them.
+- **Edit access:** A user with edit permission can also edit a shared document.
 
-**Current status:** The database contains seeded accounts for all three roles. The login endpoint returns the role from the database. Full role-based authorization and document-level permission enforcement are not implemented yet.
+The backend checks permissions. Hiding a button in the frontend is not enough because someone could still try to call the API directly.
 
-## 3. Threats and mitigations
+## 3. What could go wrong?
 
-### Threat 1: Unauthorized document access
+### Someone accesses another user's document
 
-- **Risk:** A user changes a document ID to access another user's document.
-- **Planned mitigation:** Check ownership and permissions on every protected document request.
-- **Verification:** Pending; document endpoints and authorization checks are not implemented.
+A user might try changing a document ID in the URL to access someone else's file.
 
-### Threat 2: Access after revocation
+**What I did:** Added backend checks so that document access depends on ownership or the permission granted to the user.
 
-- **Risk:** A user continues accessing a document after permission is revoked.
-- **Planned mitigation:** Check current permissions on every protected request.
-- **Verification:** Pending; document grants and revocation are not implemented.
+**What still needs testing:** I need to test all the unauthorized access cases against the final deployed version.
 
-### Threat 3: Unauthorized editing or deletion
+### Someone keeps access after it is revoked
 
-- **Risk:** A viewer attempts to edit or delete a document.
-- **Planned mitigation:** Enforce server-side read, edit, and delete permissions.
-- **Verification:** Pending.
+A user might try opening a document even after the owner removes their permission.
 
-### Threat 4: Privilege escalation
+**What I did:** Added a permission-revocation route and backend permission checks.
 
-- **Risk:** A user attempts to grant themselves administrator privileges.
-- **Planned mitigation:** Use trusted server-side role records instead of roles submitted by clients.
-- **Current control:** The current-user endpoint retrieves the role from PostgreSQL using the user ID stored in the session.
-- **Verification:** The endpoint returned the seeded viewer's database role during local testing. Attempts to alter roles and full role-specific authorization remain untested.
+**What still needs testing:** I need to confirm that access stops immediately on the next request after revocation.
 
-### Threat 5: Malicious or oversized uploads
+### A viewer tries to edit or delete a document
 
-- **Risk:** An attacker uploads a disallowed, misleading, or oversized file.
-- **Planned mitigation:** Enforce upload limits and validate file types and content.
-- **Verification:** Pending; upload functionality is not implemented.
+A viewer should not be able to make changes or delete another person's document.
 
-### Threat 6: Brute-force login attempts
+**What I did:** Editing requires ownership or edit permission, while deletion is restricted to the owner.
 
-- **Risk:** An attacker repeatedly attempts to guess account passwords.
-- **Planned mitigation:** Hash passwords securely and apply login rate limiting.
-- **Current control:** Seeded account passwords are stored as bcrypt hashes, and login verifies submitted passwords with bcrypt.
-- **Verification:** A seeded viewer login succeeded locally. Invalid-credential behavior and rate limiting still require dedicated tests.
-- **Remaining work:** Login rate limiting and automated tests for repeated failed attempts are not implemented.
+### Someone tries to become an admin
 
-### Threat 7: Audit-log tampering
+A user might try changing their role or granting themselves extra permissions.
 
-- **Risk:** A user attempts to modify or delete audit records.
-- **Planned mitigation:** Restrict audit-log operations through trusted server code and database permissions; evaluate tamper-evident integrity controls.
-- **Verification:** Pending; the audit trail is not implemented.
+**What I did:** The backend checks the logged-in user's role and validates permission changes.
 
-### Threat 8: Path traversal
+**What still needs testing:** I need to check more cases where users try to change roles or access other owners' documents.
 
-- **Risk:** A malicious filename attempts to access files outside the intended storage location.
-- **Planned mitigation:** Use server-generated storage identifiers and validate filenames.
-- **Verification:** Pending; file storage is not implemented.
+### Someone uploads a bad file
 
-### Threat 9: Missing records of denied access
+A user might upload an oversized file or a file pretending to be an allowed type.
 
-- **Risk:** Unauthorized access attempts are not recorded.
-- **Planned mitigation:** Record relevant authorization denials without logging secrets.
-- **Verification:** Pending; security-event auditing is not implemented.
+**What I did:** Added file size, file type, and file signature checks.
 
-### Threat 10: Exposed secrets
+**What is missing:** I have not added malware scanning, so these checks cannot guarantee that every uploaded file is safe.
 
-- **Risk:** Passwords, tokens, or other secrets appear in source code or logs.
-- **Planned mitigation:** Keep secrets in environment variables, exclude local environment files from version control, and avoid logging sensitive values.
-- **Current control:** A root `.env` file is used for local configuration and is listed in `.gitignore`.
-- **Verification:** The ignore rule was checked locally. A complete tracked-file and repository history review is still required before publishing.
+### Someone repeatedly guesses passwords
 
-## 4. Authentication verification
+An attacker might keep trying different passwords.
 
-The following behavior has been observed during local development:
+**What I did:** Added failed-login tracking and a temporary cooldown after repeated failures.
 
-- A seeded viewer successfully logged in using the login endpoint.
-- The protected `/api/auth/me` endpoint returned the viewer's database-backed identity and role when an authenticated session was supplied.
-- A request without an authenticated session was rejected with an authentication-required response.
-- The logout endpoint returned a successful response.
-- A subsequent request using the previous session was rejected.
+**What I tested:** Five incorrect login attempts returned HTTP 401, and the next attempt returned HTTP 429.
 
-These are manual local tests, not automated regression tests. They do not establish that every authentication edge case is secure or that document authorization is enforced.
+**What still needs testing:** Cooldown expiry and some other login edge cases need more tests. A cooldown can also be misused to temporarily block a genuine user.
 
-## 5. Planned audit trail
+### Someone changes the audit logs
 
-The intended audit trail will record security-relevant events, including document uploads, downloads, edits, deletions, permission changes, and denied access attempts.
+An attacker might try changing or removing records to hide what happened.
 
-Events should include relevant actor, action, target, timestamp, and outcome information while avoiding passwords, session tokens, and document contents.
+**What I did:** Added audit logging and a hash chain that helps detect changes to the recorded entries.
 
-Protection against alteration or deletion must be demonstrated through implementation and tests. A hash chain alone would not prevent a privileged actor from rewriting the entire chain; the final design must document its trust assumptions and limitations.
+**What I tested:** The backend test suite passed 35 tests across two test suites.
 
-**Current status:** Audit logging and tamper-evident integrity controls are not implemented.
+**What is still a risk:** Someone with enough database access might rewrite the records and calculate new hashes. The hash chain helps detect tampering, but it cannot prevent every possible attack.
 
-## 6. Verification checklist
+### Someone tries to access files through a manipulated path
 
-- [x] Local login with a seeded viewer account succeeds.
-- [x] The current-user endpoint returns database-backed identity and role for an authenticated session.
-- [x] An unauthenticated request to the current-user endpoint is rejected.
-- [x] Logout succeeds and the previous session is rejected on a subsequent request.
-- [ ] Invalid credentials are tested with dedicated repeatable tests.
-- [ ] Protected endpoints enforce the intended role policy.
-- [ ] Unauthorized users cannot read or download documents.
-- [ ] Unauthorized users cannot edit or delete documents.
-- [ ] Revoked access is denied on subsequent requests.
-- [ ] Role escalation attempts are rejected.
-- [ ] Invalid and oversized uploads are rejected.
-- [ ] Denied access attempts are recorded.
-- [ ] Ordinary users cannot modify or delete audit history.
-- [ ] Automated tests cover authorization failures and cross-user isolation.
-- [ ] Critical security checks pass on the deployed application.
+An attacker might use a specially crafted filename to access files they should not reach.
 
+**What I did:** Uploaded files use server-generated identifiers rather than relying on the original filename.
 
+### Someone steals a secret
 
-## 7. Known limitations
+Database credentials or session secrets could cause serious problems if they are exposed.
 
-This is a working threat assessment, not a security certification. Current verification is limited to manual local tests of the authentication foundation. Document permissions, file handling, role-specific access controls, automated tests, deployment security, and the audit trail remain to be implemented and verified.
+**What I did:** Local environment files are excluded from Git, and production secrets are configured through Render environment variables.
 
-Protection against a compromised server or privileged database administrator may require additional controls beyond application-level restrictions.
+**What I still need to do:** Review the repository carefully before the final submission to make sure no secrets have been committed.
+
+### Uploaded files disappear
+
+Files stored on a hosting service's temporary filesystem may disappear after a restart or redeployment.
+
+**What I did:** I deployed the backend and investigated options for storing files more reliably.
+
+**What is still missing:** Durable file storage is not yet integrated. I considered Cloudflare R2 but did not activate it because I did not want to make a billing commitment for this project.
+
+## 4. What does the admin see?
+
+The admin can view recent audit activity and check the integrity of the audit chain.
+
+The audit trail is intended to record important actions such as uploads, downloads, edits, deletions, permission changes, and relevant security events.
+
+I still need to verify that all these events are recorded correctly in the final deployed version.
+
+## 5. Where AI fits into this project
+
+AI helped me understand the requirements, plan the security controls, and work through implementation problems.
+
+If I add AI-based suggestions for sharing documents in the future, AI must never grant access on its own. The owner must make the final decision, and that decision should be recorded in the audit log.
+
+This suggestion feature is not currently implemented.
+
+## 6. What is working, and what remains?
+
+**Completed or checked:**
+
+- Backend automated tests passed: 35 tests across two suites.
+- Frontend production build completed successfully.
+- Manual testing confirmed the failed-login threshold behavior.
+- The deployed backend health endpoint responded successfully.
+- Document permission and audit functionality have been added to the local code.
+
+**Still to do:**
+
+- Test unauthorized access, editing, and deletion against the final deployment.
+- Confirm that revoking access blocks the next request.
+- Test audit records and audit-chain tampering detection.
+- Test login cooldown expiry.
+- Deploy and test the frontend.
+- Add durable file storage.
+- Verify that the deployed version contains the latest code.
+
+## 7. Current limitation
+
+The backend is deployed, but that does not mean every feature has been tested in production. The deployed version may not contain my latest local changes.
+
+I have focused first on authentication, document permissions, and audit logging. Some features, including durable file storage and full production security testing, are still unfinished.
+
+I will keep these limitations clear rather than claiming that the application is completely secure.

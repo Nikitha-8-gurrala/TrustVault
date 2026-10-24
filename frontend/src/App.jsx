@@ -36,15 +36,51 @@ function App() {
   const [password, setPassword] = useState("");
   const [search, setSearch] = useState("");
   const [category, setCategory] = useState("All categories");
+  const [createdAfter, setCreatedAfter] = useState("");
+const [createdBefore, setCreatedBefore] = useState("");
   const [showUpload, setShowUpload] = useState(false);
   const [uploadName, setUploadName] = useState("");
   const [uploadCategory, setUploadCategory] = useState("General");
   const [uploadFile, setUploadFile] = useState(null);
+  const [permissionDoc, setPermissionDoc] = useState(null);
+const [permissionEmail, setPermissionEmail] = useState("");
+const [permissionLevel, setPermissionLevel] = useState("read");
+const [documentPermissions, setDocumentPermissions] = useState([]);
 
   const loadDocuments = useCallback(async () => {
     const result = await apiRequest("/documents");
     setDocuments(result.documents || []);
   }, []);
+  const loadDocumentPermissions = useCallback(async (docId) => {
+  const result = await apiRequest(`/documents/${docId}/permissions`);
+  setDocumentPermissions(result.permissions || []);
+}, []);
+    async function handleGrantPermission(event) {
+    event.preventDefault();
+
+    if (!permissionDoc) return;
+
+    setError("");
+    setNotice("");
+
+    try {
+      await apiRequest(`/documents/${permissionDoc.id}/permissions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          userEmail: permissionEmail.trim(),
+          permission: permissionLevel,
+        }),
+      });
+
+      setNotice(`Access granted to ${permissionEmail.trim()}.`);
+      await loadDocumentPermissions(permissionDoc.id);
+      setPermissionEmail("");
+      setPermissionDoc(null);
+    } catch (err) {
+      setError(err.message);
+    }
+  }
   const loadAuditLogs = useCallback(async () => {
   setAuditLoading(true);
   try {
@@ -92,21 +128,36 @@ function App() {
   );
 
   const filteredDocuments = useMemo(() => {
-    const query = search.trim().toLowerCase();
+  const query = search.trim().toLowerCase();
 
-    return documents.filter((doc) => {
-      const matchesCategory =
-        category === "All categories" || doc.category === category;
+  return documents.filter((doc) => {
+    const matchesCategory =
+      category === "All categories" || doc.category === category;
 
-      const matchesSearch =
-        !query ||
-        [doc.name, doc.category, doc.owner_email, doc.owner_name]
-          .filter(Boolean)
-          .some((value) => String(value).toLowerCase().includes(query));
+    const matchesSearch =
+      !query ||
+      [doc.name, doc.category, doc.owner_email, doc.owner_name]
+        .filter(Boolean)
+        .some((value) => String(value).toLowerCase().includes(query));
 
-      return matchesCategory && matchesSearch;
-    });
-  }, [documents, search, category]);
+    const createdDate = doc.created_at
+      ? new Date(doc.created_at).toISOString().slice(0, 10)
+      : "";
+
+    const matchesCreatedAfter =
+      !createdAfter || (createdDate && createdDate >= createdAfter);
+
+    const matchesCreatedBefore =
+      !createdBefore || (createdDate && createdDate <= createdBefore);
+
+    return (
+      matchesCategory &&
+      matchesSearch &&
+      matchesCreatedAfter &&
+      matchesCreatedBefore
+    );
+  });
+}, [documents, search, category, createdAfter, createdBefore]);
 
   async function handleLogin(event) {
     event.preventDefault();
@@ -317,9 +368,13 @@ function App() {
               <strong>{user.email}</strong>
               <p>Administrator</p>
             </div>
-            <button className="icon-button" onClick={handleLogout}>
-              Logout
-            </button>
+            <button
+  className="secondary-button logout-button"
+  onClick={handleLogout}
+  type="button"
+>
+  Logout
+</button>
           </div>
         </aside>
 
@@ -376,7 +431,11 @@ function App() {
                       <td>{log.created_at ? new Date(log.created_at).toLocaleString() : "—"}</td>
                       <td>{log.actor_email || "System"}</td>
                       <td>{log.action}</td>
-                      <td>{log.outcome}</td>
+                      <td>
+  <span className={`audit-outcome ${log.outcome === "denied" ? "denied" : "success"}`}>
+    {log.outcome}
+  </span>
+</td>
                       <td>{log.document_id || "—"}</td>
                     </tr>
                   ))}
@@ -419,13 +478,12 @@ function App() {
             <span>{role}</span>
           </div>
           <button
-            className="icon-button"
-            onClick={handleLogout}
-            title="Sign out"
-            aria-label="Sign out"
-          >
-            ↗
-          </button>
+  className="secondary-button logout-button"
+  onClick={handleLogout}
+  type="button"
+>
+  Logout
+</button>
         </div>
       </aside>
 
@@ -557,7 +615,80 @@ function App() {
               </div>
             </form>
           )}
+                    {permissionDoc && role === "owner" && (
+            <form
+              className="upload-panel"
+              onSubmit={handleGrantPermission}
+            >
+              <h3>Manage access: {permissionDoc.name}</h3>
+              <div>
+  <h4>People with access</h4>
+  {documentPermissions.length === 0 ? (
+    <p className="muted">No access grants found.</p>
+  ) : (
+    documentPermissions.map((permission) => (
+      <div key={permission.user_id}>
+        <span>{permission.email}</span>
+        {" — "}
+        <span>{permission.permission}</span>
+        <button
+  type="button"
+  onClick={async () => {
+    try {
+      await apiRequest(
+        `/documents/${permissionDoc.id}/permissions/${permission.user_id}`,
+        { method: "DELETE" }
+      );
+      await loadDocumentPermissions(permissionDoc.id);
+      setNotice(`Access revoked for ${permission.email}.`);
+      setError("");
+    } catch (err) {
+      setError(err.message);
+    }
+  }}
+>
+  Revoke
+</button>
+      </div>
+    ))
+  )}
+</div>
+              <label>
+                Recipient email
+                <input
+                  type="email"
+                  value={permissionEmail}
+                  onChange={(event) => setPermissionEmail(event.target.value)}
+                  placeholder="user@example.com"
+                  required
+                />
+              </label>
 
+              <label>
+                Permission level
+                <select
+                  value={permissionLevel}
+                  onChange={(event) => setPermissionLevel(event.target.value)}
+                >
+                  <option value="read">Read only</option>
+                  <option value="edit">Read and edit</option>
+                </select>
+              </label>
+
+              <div className="form-actions">
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={() => setPermissionDoc(null)}
+                >
+                  Cancel
+                </button>
+                <button type="submit" className="primary-button">
+                  Grant access
+                </button>
+              </div>
+            </form>
+          )}
           <div className="filters">
             <div className="search-box">
               <span>⌕</span>
@@ -577,6 +708,25 @@ function App() {
                 <option key={item} value={item}>{item}</option>
               ))}
             </select>
+            <label>
+  Created after
+  <input
+    type="date"
+    value={createdAfter}
+    onChange={(event) => setCreatedAfter(event.target.value)}
+    aria-label="Filter documents created on or after this date"
+  />
+</label>
+
+<label>
+  Created before
+  <input
+    type="date"
+    value={createdBefore}
+    onChange={(event) => setCreatedBefore(event.target.value)}
+    aria-label="Filter documents created on or before this date"
+  />
+</label>
             <button
               className="secondary-button"
               onClick={() => loadDocuments().catch((err) => setError(err.message))}
@@ -619,8 +769,23 @@ function App() {
                         {role === "owner" && (
                           <>
                             <button onClick={() => handleEdit(doc)} title="Edit metadata">
-                              Edit
-                            </button>
+  Edit
+</button>
+
+<button
+  type="button"
+  onClick={() => {
+  setPermissionDoc(doc);
+  setPermissionEmail("");
+  setPermissionLevel("read");
+  setDocumentPermissions([]);
+  setError("");
+  setNotice("");
+  loadDocumentPermissions(doc.id).catch((err) => setError(err.message));
+}}
+>
+  Manage Access
+</button>
                             <button
                               className="danger-action"
                               onClick={() => handleDelete(doc)}

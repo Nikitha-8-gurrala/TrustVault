@@ -11,7 +11,11 @@ const uploadRouter = require("./uploads");
 require("dotenv").config();
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
+
+if (process.env.NODE_ENV === "production") {
+  app.set("trust proxy", 1);
+}
 
 app.use(express.json());
 app.use(
@@ -24,17 +28,21 @@ app.use(
     resave: false,
     saveUninitialized: false,
     cookie: {
-      httpOnly: true,
-      secure: false,
-      sameSite: "lax",
-      maxAge: 1000 * 60 * 60,
-    },
+  httpOnly: true,
+  secure: process.env.NODE_ENV === "production",
+  sameSite: "lax",
+  maxAge: 1000 * 60 * 60,
+},
   })
 );
 // Login endpoint
+
+const LOGIN_FAILURE_LIMIT = 5;
+const LOGIN_WINDOW_MINUTES = 10;
+
 app.post("/api/auth/login", async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const { email, password } = req.body || {};
 
     if (
       typeof email !== "string" ||
@@ -47,22 +55,188 @@ app.post("/api/auth/login", async (req, res) => {
       });
     }
 
+    const normalizedEmail = email.trim().toLowerCase();
+        // Enforce a five-minute cooldown after the fifth failed login.
+    const COOLDOWN_MINUTES = 5;
+
+    const securityStateResult = await pool.query(
+      `SELECT failed_attempts, alert_triggered_at
+       FROM public.login_security_events
+       WHERE email_normalized = $1`,
+      [normalizedEmail]
+    );
+
+    const securityState = securityStateResult.rows[0];
+
+    if (securityState?.failed_attempts >= LOGIN_FAILURE_LIMIT &&
+        securityState.alert_triggered_at) {
+      const lockoutEndsAt =
+        new Date(securityState.alert_triggered_at).getTime() +
+        COOLDOWN_MINUTES * 60 * 1000;
+
+      const remainingMs = lockoutEndsAt - Date.now();
+
+      if (remainingMs > 0) {
+        const remainingSeconds = Math.ceil(remainingMs / 1000);
+
+        await writeAudit({
+          actorId: null,
+          action: "security.login_blocked",
+          outcome: "denied",
+          details: {
+            reason: "login_cooldown",
+            cooldownMinutes: COOLDOWN_MINUTES,
+            remainingSeconds,
+          },
+        });
+
+        return res.status(429).json({
+          error: `Too many failed attempts. Try again in ${remainingSeconds} seconds.`,
+        });
+      }
+
+      // Cooldown expired: start a fresh failure cycle.
+      await pool.query(
+        `UPDATE public.login_security_events
+         SET failed_attempts = 0,
+             window_started_at = NOW(),
+             alert_triggered_at = NULL,
+             resolved_at = NOW(),
+             updated_at = NOW()
+         WHERE email_normalized = $1`,
+        [normalizedEmail]
+      );
+    }
     const result = await pool.query(
       `SELECT id, email, password_hash, role
        FROM users
        WHERE email = $1`,
-      [email.trim().toLowerCase()]
+      [normalizedEmail]
     );
 
     const user = result.rows[0];
 
-    if (!user || !(await bcrypt.compare(password, user.password_hash))) {
+    const passwordMatches = user
+      ? await bcrypt.compare(password, user.password_hash)
+      : false;
+
+    if (!user || !passwordMatches) {
+      // Use a keyed fingerprint instead of storing the email in audit details.
+      const emailFingerprint = require("crypto")
+        .createHmac("sha256", process.env.SESSION_SECRET)
+        .update(normalizedEmail)
+        .digest("hex")
+        .slice(0, 16);
+
+      let failedAttempts;
+      let alertTriggered = false;
+
+      const client = await pool.connect();
+
+      try {
+        await client.query("BEGIN");
+
+        // Serialize updates for this email to avoid duplicate alerts.
+        await client.query(
+          "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+          [normalizedEmail]
+        );
+
+        const counterResult = await client.query(
+          `INSERT INTO public.login_security_events (
+             email_normalized,
+             failed_attempts,
+             window_started_at,
+             last_failed_at,
+             alert_triggered_at,
+             resolved_at,
+             updated_at
+           )
+           VALUES ($1, 1, NOW(), NOW(), NULL, NULL, NOW())
+           ON CONFLICT (email_normalized)
+           DO UPDATE SET
+             failed_attempts = CASE
+               WHEN public.login_security_events.window_started_at
+                    < NOW() - ($2 * INTERVAL '1 minute')
+               THEN 1
+               ELSE public.login_security_events.failed_attempts + 1
+             END,
+             window_started_at = CASE
+               WHEN public.login_security_events.window_started_at
+                    < NOW() - ($2 * INTERVAL '1 minute')
+               THEN NOW()
+               ELSE public.login_security_events.window_started_at
+             END,
+             last_failed_at = NOW(),
+             alert_triggered_at = CASE
+               WHEN public.login_security_events.window_started_at
+                    < NOW() - ($2 * INTERVAL '1 minute')
+               THEN NULL
+               ELSE public.login_security_events.alert_triggered_at
+             END,
+             resolved_at = NULL,
+             updated_at = NOW()
+           RETURNING id, failed_attempts, alert_triggered_at`,
+          [normalizedEmail, LOGIN_WINDOW_MINUTES]
+        );
+
+        const counter = counterResult.rows[0];
+        failedAttempts = counter.failed_attempts;
+
+        if (
+          failedAttempts >= LOGIN_FAILURE_LIMIT &&
+          !counter.alert_triggered_at
+        ) {
+          const alertResult = await client.query(
+            `UPDATE public.login_security_events
+             SET alert_triggered_at = NOW(),
+                 updated_at = NOW()
+             WHERE id = $1
+               AND alert_triggered_at IS NULL
+             RETURNING id, failed_attempts`,
+            [counter.id]
+          );
+
+          alertTriggered = alertResult.rowCount === 1;
+        }
+
+        await client.query("COMMIT");
+      } catch (trackingError) {
+        await client.query("ROLLBACK").catch(() => {});
+        throw trackingError;
+      } finally {
+        client.release();
+      }
+
+      // Record the denied login in the existing audit chain.
+      await writeAudit({
+        actorId: null,
+        action: "auth.login.failed",
+        outcome: "denied",
+        details: {
+          reason: "invalid_credentials",
+          emailFingerprint,
+        },
+      });
+
+      if (alertTriggered) {
+        await writeAudit({
+          actorId: null,
+          action: "security.login_threshold",
+          outcome: "denied",
+          details: {
+            emailFingerprint,
+            failedAttempts,
+            windowMinutes: LOGIN_WINDOW_MINUTES,
+          },
+        });
+      }
+
       return res.status(401).json({
         error: "Invalid email or password.",
       });
     }
-
-    req.session.regenerate((sessionError) => {
+      req.session.regenerate ((sessionError) => {
       if (sessionError) {
         console.error("Session creation failed.");
         return res.status(500).json({
@@ -72,12 +246,29 @@ app.post("/api/auth/login", async (req, res) => {
 
       req.session.userId = user.id;
 
-      req.session.save((saveError) => {
+      req.session.save(async (saveError) => {
         if (saveError) {
           console.error("Session save failed.");
           return res.status(500).json({
             error: "Unable to save session.",
           });
+        }
+
+        // Clear failed-login tracking only after the session is saved.
+        try {
+          await pool.query(
+            `UPDATE public.login_security_events
+             SET failed_attempts = 0,
+                 window_started_at = NOW(),
+                 alert_triggered_at = NULL,
+                 resolved_at = NOW(),
+                 updated_at = NOW()
+             WHERE email_normalized = $1`,
+            [normalizedEmail]
+          );
+        } catch (resetError) {
+          // Don't report login failure after the session was saved.
+          console.error("Login counter reset failed:", resetError.message);
         }
 
         return res.status(200).json({
@@ -97,6 +288,7 @@ app.post("/api/auth/login", async (req, res) => {
     });
   }
 });
+
 // Authentication middleware
 async function requireAuth(req, res, next) {
   try {
@@ -411,6 +603,35 @@ if (result.rows.length === 0) {
   }
 );
 
+app.get(
+  "/api/documents/:id/permissions",
+  requireAuth,
+  requireRole("owner"),
+  async (req, res) => {
+    try {
+      const result = await pool.query(
+        `SELECT p.user_id, u.email, p.permission, p.created_at
+         FROM document_permissions AS p
+         JOIN users AS u ON u.id = p.user_id
+         JOIN documents AS d ON d.id = p.document_id
+         WHERE p.document_id = $1
+           AND d.owner_id = $2
+         ORDER BY p.created_at DESC`,
+        [req.params.id, req.user.id]
+      );
+
+      return res.status(200).json({
+        permissions: result.rows,
+      });
+    } catch (error) {
+      console.error("Permission listing failed:", error.message);
+      return res.status(500).json({
+        error: "Unable to retrieve document permissions.",
+      });
+    }
+  }
+);
+
  // List documents owned by the logged-in user
 app.get(
   "/api/documents",
@@ -492,7 +713,7 @@ app.get(
           actorId: req.user.id,
           action: "document.download",
           documentId: document.id,
-          outcome: "failure",
+          outcome: "denied",
           details: { reason: "stored_file_missing_or_invalid" },
         });
 
@@ -509,7 +730,7 @@ res.download(filePath, document.name, async (error) => {
             actorId: req.user.id,
             action: "document.download",
             documentId: document.id,
-            outcome: error ? "failure" : "success",
+            outcome: error ? "denied" : "success",
             details: error
               ? { reason: "transfer_failed" }
               : { reason: "transfer_completed" },
@@ -751,7 +972,7 @@ app.post("/api/auth/logout", (req, res) => {
     res.clearCookie("connect.sid", {
       httpOnly: true,
       sameSite: "lax",
-      secure: false,
+      secure: process.env.NODE_ENV === "production",
     });
 
     return res.status(200).json({
@@ -778,7 +999,7 @@ app.get("/api/health", (req, res) => {
 });
 
 if (require.main === module) {
-  app.listen(PORT, () => {
+  app.listen(PORT, "0.0.0.0", () => {
     console.log(`TrustVault API running on port ${PORT}`);
   });
 }

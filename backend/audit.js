@@ -2,6 +2,8 @@
 const crypto = require("crypto");
 const pool = require("./db");
 
+const VALID_OUTCOMES = new Set(["success", "denied"]);
+
 function stableStringify(value) {
   if (value === null || typeof value !== "object") {
     return JSON.stringify(value);
@@ -12,13 +14,19 @@ function stableStringify(value) {
   }
 
   const keys = Object.keys(value).sort();
+
   return `{${keys
-    .map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`)
+    .map(
+      (key) =>
+        `${JSON.stringify(key)}:${stableStringify(value[key])}`
+    )
     .join(",")}}`;
 }
 
 function toId(value) {
-  return value === undefined || value === null ? null : String(value);
+  return value === undefined || value === null
+    ? null
+    : String(value);
 }
 
 function calculateHash(event) {
@@ -36,11 +44,38 @@ async function writeAudit({
   outcome,
   details = {},
 }) {
+  // Validate input before opening a database transaction.
+  if (typeof action !== "string" || !action.trim()) {
+    throw new Error("Audit action is required.");
+  }
+
+  if (!VALID_OUTCOMES.has(outcome)) {
+    throw new Error(
+      'Invalid audit outcome. Use "success" or "denied".'
+    );
+  }
+
+  if (
+    details === null ||
+    typeof details !== "object" ||
+    Array.isArray(details)
+  ) {
+    throw new Error("Audit details must be an object.");
+  }
+
   const client = await pool.connect();
+  let transactionStarted = false;
 
   try {
     await client.query("BEGIN");
-    await client.query("SELECT pg_advisory_xact_lock($1)", [741852963]);
+    transactionStarted = true;
+
+    // Serialize chain writes so concurrent events cannot share
+    // the same previous hash.
+    await client.query(
+      "SELECT pg_advisory_xact_lock($1)",
+      [741852963]
+    );
 
     const previousResult = await client.query(
       `SELECT entry_hash
@@ -52,13 +87,15 @@ async function writeAudit({
     const previousHash =
       previousResult.rows[0]?.entry_hash ?? "GENESIS";
 
+    // Preserve the existing hash format for compatibility
+    // with already-written audit entries.
     const event = {
       actorId: toId(actorId),
       action,
       documentId: toId(documentId),
       targetUserId: toId(targetUserId),
       outcome,
-      details: JSON.parse(JSON.stringify(details ?? {})),
+      details: JSON.parse(JSON.stringify(details)),
       previousHash,
     };
 
@@ -66,8 +103,16 @@ async function writeAudit({
 
     await client.query(
       `INSERT INTO public.audit_chain_logs
-       (actor_id, action, document_id, target_user_id,
-        outcome, details, previous_hash, entry_hash)
+       (
+         actor_id,
+         action,
+         document_id,
+         target_user_id,
+         outcome,
+         details,
+         previous_hash,
+         entry_hash
+       )
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
       [
         event.actorId,
@@ -82,8 +127,12 @@ async function writeAudit({
     );
 
     await client.query("COMMIT");
+    transactionStarted = false;
   } catch (error) {
-    await client.query("ROLLBACK");
+    if (transactionStarted) {
+      await client.query("ROLLBACK").catch(() => {});
+    }
+
     throw error;
   } finally {
     client.release();
@@ -92,9 +141,16 @@ async function writeAudit({
 
 async function verifyAuditChain() {
   const result = await pool.query(
-    `SELECT id, actor_id, action, document_id,
-            target_user_id, outcome, details,
-            previous_hash, entry_hash
+    `SELECT
+       id,
+       actor_id,
+       action,
+       document_id,
+       target_user_id,
+       outcome,
+       details,
+       previous_hash,
+       entry_hash
      FROM public.audit_chain_logs
      ORDER BY id ASC`
   );
@@ -150,4 +206,7 @@ async function verifyAuditChain() {
   };
 }
 
-module.exports = { writeAudit, verifyAuditChain };
+module.exports = {
+  writeAudit,
+  verifyAuditChain,
+};
